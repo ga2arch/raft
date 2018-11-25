@@ -122,11 +122,12 @@ func (node *Node) Handshake(req *HandshakeRequest, reply *HandshakeResponse) err
 
 	// create peer
 	peer := &Peer{Addr: req.Addr, Client: client}
+	node.Peers = append(node.Peers, peer)
+
 	if node.CurrentState == LEADER {
 		node.NextIndex = append(node.NextIndex, len(node.Log))
 		node.MatchIndex = append(node.MatchIndex, 0)
 	}
-	node.Peers = append(node.Peers, peer)
 
 	reply = &HandshakeResponse{}
 
@@ -153,7 +154,7 @@ func (node *Node) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesR
 		return errors.New("invalid prev log")
 	}
 
-	node.Log = append(node.Log[:req.PrevLogIndex], req.Entries...)
+	node.Log = append(node.Log[:req.PrevLogIndex+1], req.Entries...)
 
 	if req.LeaderCommit > node.CommitIndex {
 		node.CommitIndex = min(req.LeaderCommit, len(node.Log)-1)
@@ -250,8 +251,12 @@ func main() {
 			node.SendHearthbeat()
 			go func() {
 				once.Do(func() {
-					time.Sleep(5 * time.Second)
+					time.Sleep(10 * time.Second)
 					node.AppendCommand("SET kek lol")
+
+					time.Sleep(15 * time.Second)
+					node.AppendCommand("SET g b")
+
 				})
 			}()
 
@@ -339,16 +344,16 @@ func (node *Node) AppendCommand(cmd string) {
 	log.Printf("appending command to log %+v", cmd)
 
 	node.Mutex.Lock()
+	node.Log = append(node.Log, LogEntry{Command: cmd, Term: node.CurrentTerm})
 	lastLogIndex := len(node.Log) - 1
 	lastLogTem := node.Log[lastLogIndex].Term
 	commitIndex := node.CommitIndex
-	node.Log = append(node.Log, LogEntry{Command: cmd, Term: node.CurrentTerm})
 	node.Mutex.Unlock()
 
 	log.Printf("%+v", node.NextIndex)
 
 	for i, peer := range node.Peers {
-		nextIndex := node.NextIndex[i]
+		nextIndex := node.NextIndex[i] // ni: 1 lli: 1
 		var entries []LogEntry
 		if lastLogIndex >= nextIndex {
 			for x := nextIndex; x < lastLogIndex+1; x++ {
@@ -357,11 +362,11 @@ func (node *Node) AppendCommand(cmd string) {
 		}
 
 		var reply AppendEntriesResponse
-		log.Printf("sending AppendEntries to %v", peer)
+		log.Printf("sending AppendEntries to %v, entries: %+v", peer, entries)
 		err := peer.Client.Call("Node.AppendEntries", &AppendEntriesRequest{
 			Term:         node.CurrentTerm,
 			LeaderId:     node.Id,
-			PrevLogIndex: lastLogIndex,
+			PrevLogIndex: lastLogIndex-1,
 			PrevLogTerm:  lastLogTem,
 			Entries:      entries,
 			LeaderCommit: commitIndex,
