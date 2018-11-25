@@ -135,7 +135,7 @@ func (node *Node) Handshake(req *HandshakeRequest, reply *HandshakeResponse) err
 }
 
 func (node *Node) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesResponse) error {
-	log.Printf("node: %+v, req: %+v", node, req)
+	log.Printf("AppendEntries: node: %+v, req: %+v", node, req)
 
 	node.PingChan <- 1
 	node.Mutex.Lock()
@@ -164,10 +164,12 @@ func (node *Node) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesR
 		for i := 0; i < (node.CommitIndex - node.LastApplied); i++ {
 			log.Printf("applying %v", node.Log[node.LastApplied+i])
 		}
+		node.LastApplied = node.CommitIndex
 	}
 
 	if req.Term > node.CurrentTerm {
 		node.CurrentState = FOLLOWER
+		node.CurrentTerm = req.Term
 	}
 
 	reply = &AppendEntriesResponse{Term: node.CurrentTerm}
@@ -175,6 +177,8 @@ func (node *Node) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesR
 }
 
 func (node *Node) RequestVote(req *RequestVoteRequest, reply *RequestVoteResponse) error {
+	log.Printf("RequestVote: node: %+v, req: %+v", node, req)
+
 	node.Mutex.Lock()
 	defer node.Mutex.Unlock()
 
@@ -191,6 +195,11 @@ func (node *Node) RequestVote(req *RequestVoteRequest, reply *RequestVoteRespons
 		if entry.Term != req.LastLogTerm {
 			return errors.New("last log term is out of sync")
 		}
+	}
+
+	if req.Term > node.CurrentTerm {
+		node.CurrentState = FOLLOWER
+		node.CurrentTerm = req.Term
 	}
 
 	reply = &RequestVoteResponse{Term: node.CurrentTerm}
@@ -345,18 +354,19 @@ func (node *Node) AppendCommand(cmd string) {
 
 	node.Mutex.Lock()
 	node.Log = append(node.Log, LogEntry{Command: cmd, Term: node.CurrentTerm})
-	lastLogIndex := len(node.Log) - 1
-	lastLogTem := node.Log[lastLogIndex].Term
+	lastLogIndex := len(node.Log)
 	commitIndex := node.CommitIndex
 	node.Mutex.Unlock()
 
 	log.Printf("%+v", node.NextIndex)
 
-	for i, peer := range node.Peers {
+	for i := 0; i < len(node.Peers); i++ {
+		peer := node.Peers[i]
 		nextIndex := node.NextIndex[i] // ni: 1 lli: 1
+		prevLogIndex := nextIndex-1
 		var entries []LogEntry
 		if lastLogIndex >= nextIndex {
-			for x := nextIndex; x < lastLogIndex+1; x++ {
+			for x := nextIndex; x < lastLogIndex; x++ {
 				entries = append(entries, node.Log[x])
 			}
 		}
@@ -366,18 +376,21 @@ func (node *Node) AppendCommand(cmd string) {
 		err := peer.Client.Call("Node.AppendEntries", &AppendEntriesRequest{
 			Term:         node.CurrentTerm,
 			LeaderId:     node.Id,
-			PrevLogIndex: lastLogIndex-1,
-			PrevLogTerm:  lastLogTem,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  node.Log[prevLogIndex].Term,
 			Entries:      entries,
 			LeaderCommit: commitIndex,
 		}, &reply)
 
 		if err != nil {
 			log.Printf("error while calling %v, err: %s", peer, err)
-		}
+			node.NextIndex[i] -= 1
+			i -= 1
 
-		node.NextIndex[i] = len(node.Log)
-		node.MatchIndex[i] = len(node.Log) - 1
+		} else {
+			node.NextIndex[i] = len(node.Log)
+			node.MatchIndex[i] = len(node.Log) - 1
+		}
 	}
 
 	for n := commitIndex + 1; n < len(node.Log) && node.Log[n].Term == node.CurrentTerm; n++ {
@@ -393,6 +406,13 @@ func (node *Node) AppendCommand(cmd string) {
 			node.CommitIndex = n
 			break
 		}
+	}
+
+	if node.CommitIndex > node.LastApplied {
+		for i := 0; i < (node.CommitIndex - node.LastApplied); i++ {
+			log.Printf("applying %v", node.Log[node.LastApplied+i])
+		}
+		node.LastApplied = node.CommitIndex
 	}
 }
 
