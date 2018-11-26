@@ -7,3 +7,7 @@ type ChangeStateCmd struct {
 
 type SendHeartbeatsCmd struct {
 }
+
+type AddLogCmd struct {
+	Command string
+}

@@ -80,6 +80,9 @@ func (node *Node) Run() {
 
 		case AddPeerCmd:
 			node.addPeer(msg)
+
+		case AddLogCmd:
+			node.addLog(msg)
 		}
 	}
 }
@@ -90,6 +93,13 @@ func (node *Node) changeState(message Message) {
 	switch payload.State {
 	case LEADER:
 		node.startHeartbeat()
+
+		node.MatchIndex = make([]int, len(node.Peers))
+		node.NextIndex = make([]int, len(node.Peers))
+		for i := range node.Peers {
+			node.NextIndex[i] = len(node.Log)
+			node.MatchIndex[i] = 0
+		}
 
 	case FOLLOWER:
 		if node.CurrentState == LEADER {
@@ -262,5 +272,73 @@ func (node *Node) addPeer(message Message) {
 	if node.CurrentState == LEADER {
 		node.NextIndex = append(node.NextIndex, len(node.Log))
 		node.MatchIndex = append(node.MatchIndex, 0)
+	}
+}
+
+func (node *Node) addLog(message Message) {
+	req := message.Payload.(AddLogCmd)
+	sender := message.Sender
+	cmd := req.Command
+
+	log.Printf("appending command to log %+v", cmd)
+
+	node.Log = append(node.Log, LogEntry{Command: cmd, Term: node.CurrentTerm})
+	lastLogIndex := len(node.Log)
+	commitIndex := node.CommitIndex
+
+	for i := 0; i < len(node.Peers); i++ {
+		peer := node.Peers[i]
+		nextIndex := node.NextIndex[i] // ni: 1 lli: 1
+		prevLogIndex := nextIndex - 1
+		var entries []Entry
+		if lastLogIndex >= nextIndex {
+			for x := nextIndex; x < lastLogIndex; x++ {
+				logEntry := node.Log[x]
+				entries = append(entries, Entry{logEntry.Command, logEntry.Term})
+			}
+		}
+
+		var reply AppendEntriesResponse
+		log.Printf("sending AppendEntries to %v, entries: %+v", peer, entries)
+		err := peer.Client.Call("Node.AppendEntries", &AppendEntriesCmd{
+			Term:         node.CurrentTerm,
+			LeaderId:     node.Id,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  node.Log[prevLogIndex].Term,
+			Entries:      entries,
+			LeaderCommit: commitIndex,
+		}, &reply)
+
+		if err != nil {
+			log.Printf("error while calling %v, err: %s", peer, err)
+			node.NextIndex[i] -= 1
+			i -= 1
+
+		} else {
+			node.NextIndex[i] = len(node.Log)
+			node.MatchIndex[i] = len(node.Log) - 1
+		}
+	}
+
+	for n := commitIndex + 1; n < len(node.Log) && node.Log[n].Term == node.CurrentTerm; n++ {
+		matches := 0
+		for i := range node.Peers {
+			if node.MatchIndex[i] >= n {
+				matches += 1
+			}
+		}
+
+		if matches > len(node.Peers)/2 {
+			log.Printf("update commit index to: %d", n)
+			node.CommitIndex = n
+			break
+		}
+	}
+
+	if node.CommitIndex > node.LastApplied {
+		for i := 0; i < (node.CommitIndex - node.LastApplied); i++ {
+			log.Printf("applying %v", node.Log[node.LastApplied+i])
+		}
+		node.LastApplied = node.CommitIndex
 	}
 }
