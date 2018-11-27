@@ -51,7 +51,7 @@ type Node struct {
 
 func NewFollowerNode() *Node {
 	return &Node{
-		CurrentState: FOLLOWER,
+		CurrentState:    FOLLOWER,
 		Id:              uuid.NewV4().String(),
 		MessageChan:     make(chan Message, 10),
 		Log:             []LogEntry{{Command: "", Term: 0}},
@@ -188,15 +188,18 @@ func (node *Node) stopHeartbeat() {
 }
 
 func (node *Node) sendHeartbeats() {
-	lastLogIndex := len(node.Log) - 1
-	lastLogTem := node.Log[lastLogIndex].Term
 	commitIndex := node.CommitIndex
 
 	for i := range node.Peers {
 		if node.Peers[i] == nil {
 			continue
 		}
-		go node.sendHeartbeat(i, node.Id, node.CurrentTerm, lastLogIndex, lastLogTem, commitIndex, nil)
+
+		nextIndex := node.NextIndex[i]
+		prevLogIndex := nextIndex - 1
+		prevLogTerm := node.Log[prevLogIndex].Term
+
+		go node.sendHeartbeat(i, node.Id, node.CurrentTerm, prevLogIndex, prevLogTerm, commitIndex, nil)
 	}
 }
 
@@ -220,14 +223,6 @@ func (node *Node) appendEntries(message Message) {
 		sender <- Message{Payload: AppendEntriesResponse{Term: node.CurrentTerm, Success: false}}
 	}
 
-	if len(req.Entries) == 0 {
-		sender <- Message{Payload: AppendEntriesResponse{Term: node.CurrentTerm, Success: true}}
-		if node.CurrentState == CANDIDATE {
-			node.MessageChan <- Message{Payload: ChangeStateCmd{Term: req.Term, State: FOLLOWER}}
-		}
-		return
-	}
-
 	if req.PrevLogIndex >= len(node.Log) {
 		log.Printf("invalid prev log")
 		sender <- Message{Payload: AppendEntriesResponse{Term: node.CurrentTerm, Success: true}}
@@ -243,15 +238,16 @@ func (node *Node) appendEntries(message Message) {
 	}
 
 	if node.CommitIndex > node.LastApplied {
-		for i := 0; i < (node.CommitIndex - node.LastApplied); i++ {
-			log.Printf("applying %v", node.Log[node.LastApplied+i])
+		for i := node.LastApplied + 1; i < node.CommitIndex+1; i++ {
+			log.Printf("applying %v", node.Log[i])
 		}
 		node.LastApplied = node.CommitIndex
 	}
 
-	if req.Term > node.CurrentTerm {
+	if req.Term > node.CurrentTerm || node.CurrentState == CANDIDATE {
 		node.MessageChan <- Message{Payload: ChangeStateCmd{Term: req.Term, State: FOLLOWER}}
 	}
+
 	sender <- Message{Payload: AppendEntriesResponse{Term: node.CurrentTerm, Success: true}}
 }
 
@@ -349,6 +345,8 @@ func (node *Node) sendEntries(
 		LeaderCommit: commitIndex,
 	}, &reply)
 
+	log.Printf("append response %+v", reply)
+
 	if err != nil {
 		log.Printf("error while calling %v, err: %s", peer, err)
 		if err == rpc.ErrShutdown {
@@ -358,11 +356,11 @@ func (node *Node) sendEntries(
 	} else if reply.Term > node.CurrentTerm {
 		node.MessageChan <- Message{Payload: ChangeStateCmd{Term: reply.Term, State: FOLLOWER}}
 
-	} else if sender != nil && reply.Success {
-		sender <- Message{Payload: IncrementPeerIndexesCmd{Pos: peerPos}, Sender: nil}
+	} else if reply.Success {
+		node.MessageChan <- Message{Payload: IncrementPeerIndexesCmd{Pos: peerPos}, Sender: nil}
 
-	} else if sender != nil && !reply.Success {
-		sender <- Message{Payload: DecrementPeerIndexesCmd{Pos: peerPos}, Sender: nil}
+	} else {
+		node.MessageChan <- Message{Payload: DecrementPeerIndexesCmd{Pos: peerPos}, Sender: nil}
 	}
 }
 
@@ -386,7 +384,7 @@ func (node *Node) addLog(message Message) {
 			continue
 		}
 
-		nextIndex := node.NextIndex[i] // ni: 1 lli: 1
+		nextIndex := node.NextIndex[i]
 		prevLogIndex := nextIndex - 1
 		prevLogTerm := node.Log[prevLogIndex].Term
 
@@ -428,8 +426,8 @@ func (node *Node) incrementPeerIndexes(message Message) {
 	}
 
 	if node.CommitIndex > node.LastApplied {
-		for i := 0; i < (node.CommitIndex - node.LastApplied); i++ {
-			log.Printf("applying %v", node.Log[node.LastApplied+i])
+		for i := node.LastApplied + 1; i < node.CommitIndex+1; i++ {
+			log.Printf("applying %v", node.Log[i])
 		}
 		node.LastApplied = node.CommitIndex
 	}
