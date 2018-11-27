@@ -39,7 +39,7 @@ type HandshakeResponse struct {
 }
 
 type RpcConfig struct {
-	NodeChan chan interface{}
+	NodeChan chan Message
 }
 
 func (config *RpcConfig) AppendEntries(req *AppendEntriesCmd, reply *AppendEntriesResponse) error {

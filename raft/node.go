@@ -26,14 +26,16 @@ type LogEntry struct {
 }
 
 type Node struct {
-	Id           string
-	CurrentState State
-	Peers        []*Peer
-	CurrentTerm  int
-	CommitIndex  int
-	LastApplied  int
-	Log          []LogEntry
-	VotedFor     string
+	Id              string
+	CurrentState    State
+	Peers           []*Peer
+	PeersNum        int
+	CurrentTerm     int
+	CommitIndex     int
+	LastApplied     int
+	Log             []LogEntry
+	VotedFor        string
+	LastMessageTime time.Time
 
 	// actor
 	MessageChan   chan Message
@@ -42,26 +44,37 @@ type Node struct {
 	// leader only
 	NextIndex  [] int
 	MatchIndex [] int
+
+	// candidate only
+	Votes int
 }
 
 func NewFollowerNode() *Node {
-	return &Node{CurrentState: FOLLOWER,
-		Id:          uuid.NewV4().String(),
-		MessageChan: make(chan Message),
-		Log:         []LogEntry{{Command: "", Term: 0}},
-		CurrentTerm: 0,
-		CommitIndex: 0,
-		LastApplied: 0,
-		VotedFor:    ""}
+	return &Node{
+		CurrentState: FOLLOWER,
+		Id:              uuid.NewV4().String(),
+		MessageChan:     make(chan Message, 10),
+		Log:             []LogEntry{{Command: "", Term: 0}},
+		LastMessageTime: time.Now().UTC(),
+	}
 }
 
 func (node *Node) Send(m Message) {
 	node.MessageChan <- m
 }
 
+func (node *Node) AddPeer(peer *Peer) {
+	node.Peers = append(node.Peers, peer)
+	node.PeersNum += 1
+}
+
 func (node *Node) Run() {
+	go node.startElectionTimer()
+
 	for {
 		msg := <-node.MessageChan
+		log.Printf("node: %+v, received: %+v, type %T", node, msg, msg.Payload)
+
 		switch msg.Payload.(type) {
 		case ChangeStateCmd:
 			node.changeState(msg)
@@ -70,9 +83,11 @@ func (node *Node) Run() {
 			node.sendHeartbeats()
 
 		case AppendEntriesCmd:
+			node.LastMessageTime = time.Now().UTC()
 			node.appendEntries(msg)
 
 		case RequestVoteCmd:
+			node.LastMessageTime = time.Now().UTC()
 			node.requestVote(msg)
 
 		case HandshakeCmd:
@@ -81,36 +96,77 @@ func (node *Node) Run() {
 		case AddPeerCmd:
 			node.addPeer(msg)
 
+		case RemovePeerCmd:
+			node.removePeer(msg)
+
 		case AddLogCmd:
 			node.addLog(msg)
+
+		case IncrementPeerIndexesCmd:
+			node.incrementPeerIndexes(msg)
+
+		case DecrementPeerIndexesCmd:
+			node.decrementPeerIndexes(msg)
+
+		case AddVoteCmd:
+			node.addVote()
+
+		case StartElectionCmd:
+			if node.CurrentState != LEADER && time.Since(node.LastMessageTime).Seconds()*1e3 >= 150 {
+				node.MessageChan <- Message{Payload: ChangeStateCmd{State: CANDIDATE}}
+			}
 		}
 	}
 }
 
 func (node *Node) changeState(message Message) {
 	payload := message.Payload.(ChangeStateCmd)
+	node.Votes = 0
 
 	switch payload.State {
 	case LEADER:
-		node.startHeartbeat()
+		node.CurrentState = LEADER
+
+		log.Printf("become leader")
+		go node.startHeartbeat()
 
 		node.MatchIndex = make([]int, len(node.Peers))
 		node.NextIndex = make([]int, len(node.Peers))
 		for i := range node.Peers {
+			if node.Peers[i] == nil {
+				continue
+			}
+
 			node.NextIndex[i] = len(node.Log)
 			node.MatchIndex[i] = 0
 		}
 
 	case FOLLOWER:
+		log.Printf("become follower")
 		if node.CurrentState == LEADER {
 			node.stopHeartbeat()
 		}
+		node.CurrentTerm = payload.Term
+		node.CurrentState = FOLLOWER
+		node.VotedFor = ""
 
 	case CANDIDATE:
+		log.Printf("become candidate")
+		node.CurrentState = CANDIDATE
+		node.CurrentTerm += 1
+		lastLogIndex := len(node.Log) - 1
+		lastLogTem := node.Log[lastLogIndex].Term
 
+		node.addVote()
+		node.VotedFor = node.Id
+		for i, peer := range node.Peers {
+			if node.Peers[i] == nil {
+				continue
+			}
+
+			go node.vote(peer, i, node.Id, node.CurrentTerm, lastLogIndex, lastLogTem, node.MessageChan)
+		}
 	}
-
-	node.CurrentState = payload.State
 }
 
 func (node *Node) startHeartbeat() {
@@ -137,34 +193,20 @@ func (node *Node) sendHeartbeats() {
 	commitIndex := node.CommitIndex
 
 	for i := range node.Peers {
-		go node.sendHeartbeat(node.Peers[i], node.Id, node.CurrentTerm, lastLogIndex, lastLogTem, commitIndex, node.MessageChan)
+		if node.Peers[i] == nil {
+			continue
+		}
+		go node.sendHeartbeat(i, node.Id, node.CurrentTerm, lastLogIndex, lastLogTem, commitIndex, nil)
 	}
 }
 
 func (node *Node) sendHeartbeat(
-	peer *Peer,
+	peerPos int,
 	nodeId string,
 	currentTerm, lastLogIndex, lastLogTerm, commitIndex int,
 	sender chan Message) {
 
-	log.Printf("sending AppendEntries to %v", peer)
-
-	var reply AppendEntriesResponse
-	err := peer.Client.Call("Node.AppendEntries", &AppendEntriesCmd{
-		Term:         currentTerm,
-		LeaderId:     nodeId,
-		PrevLogIndex: lastLogIndex,
-		PrevLogTerm:  lastLogTerm,
-		Entries:      make([]Entry, 0),
-		LeaderCommit: commitIndex,
-	}, &reply)
-
-	if err != nil {
-		log.Printf("error while calling %v, err: %s", peer, err)
-
-	} else {
-		sender <- Message{Payload: reply, Sender: nil}
-	}
+	node.sendEntries(node.Peers[peerPos], peerPos, nodeId, currentTerm, lastLogIndex, lastLogTerm, commitIndex, make([]Entry, 0), sender)
 }
 
 func (node *Node) appendEntries(message Message) {
@@ -180,6 +222,9 @@ func (node *Node) appendEntries(message Message) {
 
 	if len(req.Entries) == 0 {
 		sender <- Message{Payload: AppendEntriesResponse{Term: node.CurrentTerm, Success: true}}
+		if node.CurrentState == CANDIDATE {
+			node.MessageChan <- Message{Payload: ChangeStateCmd{Term: req.Term, State: FOLLOWER}}
+		}
 		return
 	}
 
@@ -207,6 +252,7 @@ func (node *Node) appendEntries(message Message) {
 	if req.Term > node.CurrentTerm {
 		node.MessageChan <- Message{Payload: ChangeStateCmd{Term: req.Term, State: FOLLOWER}}
 	}
+	sender <- Message{Payload: AppendEntriesResponse{Term: node.CurrentTerm, Success: true}}
 }
 
 func (node *Node) requestVote(message Message) {
@@ -236,15 +282,16 @@ func (node *Node) requestVote(message Message) {
 		}
 	}
 
-	sender <- Message{Payload: RequestVoteResponse{Term: node.CurrentTerm, VoteGranted: true}}
-
 	if req.Term > node.CurrentTerm {
 		node.MessageChan <- Message{Payload: ChangeStateCmd{Term: req.Term, State: FOLLOWER}}
 	}
-}
 
-type AddPeerCmd struct {
-	Peer Peer
+	if node.CurrentState != LEADER {
+		sender <- Message{Payload: RequestVoteResponse{Term: node.CurrentTerm, VoteGranted: true}}
+
+	} else {
+		sender <- Message{Payload: RequestVoteResponse{Term: node.CurrentTerm, VoteGranted: false}}
+	}
 }
 
 func (node *Node) handShake(message Message) {
@@ -263,15 +310,59 @@ func (node *Node) handShake(message Message) {
 	peer := Peer{Addr: req.Addr, Client: client}
 
 	node.MessageChan <- Message{Payload: AddPeerCmd{Peer: peer}}
+	sender <- Message{Payload: HandshakeResponse{}}
 }
 
 func (node *Node) addPeer(message Message) {
 	req := message.Payload.(AddPeerCmd)
-	node.Peers = append(node.Peers, &req.Peer)
+	node.AddPeer(&req.Peer)
 
 	if node.CurrentState == LEADER {
 		node.NextIndex = append(node.NextIndex, len(node.Log))
 		node.MatchIndex = append(node.MatchIndex, 0)
+	}
+}
+
+func (node *Node) removePeer(message Message) {
+	req := message.Payload.(RemovePeerCmd)
+	node.Peers[req.Pos] = nil
+	node.PeersNum -= 1
+}
+
+func (node *Node) sendEntries(
+	peer *Peer,
+	peerPos int,
+	nodeId string,
+	currentTerm, lastLogIndex, lastLogTerm, commitIndex int,
+	entries []Entry,
+	sender chan Message) {
+
+	log.Printf("sending AppendEntries to %v", peer)
+
+	var reply AppendEntriesResponse
+	err := peer.Client.Call("RpcConfig.AppendEntries", &AppendEntriesCmd{
+		Term:         currentTerm,
+		LeaderId:     nodeId,
+		PrevLogIndex: lastLogIndex,
+		PrevLogTerm:  lastLogTerm,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}, &reply)
+
+	if err != nil {
+		log.Printf("error while calling %v, err: %s", peer, err)
+		if err == rpc.ErrShutdown {
+			node.MessageChan <- Message{Payload: RemovePeerCmd{Pos: peerPos}, Sender: nil}
+		}
+
+	} else if reply.Term > node.CurrentTerm {
+		node.MessageChan <- Message{Payload: ChangeStateCmd{Term: reply.Term, State: FOLLOWER}}
+
+	} else if sender != nil && reply.Success {
+		sender <- Message{Payload: IncrementPeerIndexesCmd{Pos: peerPos}, Sender: nil}
+
+	} else if sender != nil && !reply.Success {
+		sender <- Message{Payload: DecrementPeerIndexesCmd{Pos: peerPos}, Sender: nil}
 	}
 }
 
@@ -280,6 +371,10 @@ func (node *Node) addLog(message Message) {
 	sender := message.Sender
 	cmd := req.Command
 
+	if node.CurrentState != LEADER {
+		return
+	}
+
 	log.Printf("appending command to log %+v", cmd)
 
 	node.Log = append(node.Log, LogEntry{Command: cmd, Term: node.CurrentTerm})
@@ -287,9 +382,14 @@ func (node *Node) addLog(message Message) {
 	commitIndex := node.CommitIndex
 
 	for i := 0; i < len(node.Peers); i++ {
-		peer := node.Peers[i]
+		if node.Peers[i] == nil {
+			continue
+		}
+
 		nextIndex := node.NextIndex[i] // ni: 1 lli: 1
 		prevLogIndex := nextIndex - 1
+		prevLogTerm := node.Log[prevLogIndex].Term
+
 		var entries []Entry
 		if lastLogIndex >= nextIndex {
 			for x := nextIndex; x < lastLogIndex; x++ {
@@ -298,37 +398,29 @@ func (node *Node) addLog(message Message) {
 			}
 		}
 
-		var reply AppendEntriesResponse
-		log.Printf("sending AppendEntries to %v, entries: %+v", peer, entries)
-		err := peer.Client.Call("Node.AppendEntries", &AppendEntriesCmd{
-			Term:         node.CurrentTerm,
-			LeaderId:     node.Id,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  node.Log[prevLogIndex].Term,
-			Entries:      entries,
-			LeaderCommit: commitIndex,
-		}, &reply)
-
-		if err != nil {
-			log.Printf("error while calling %v, err: %s", peer, err)
-			node.NextIndex[i] -= 1
-			i -= 1
-
-		} else {
-			node.NextIndex[i] = len(node.Log)
-			node.MatchIndex[i] = len(node.Log) - 1
-		}
+		go node.sendEntries(node.Peers[i], i, node.Id, node.CurrentTerm, prevLogIndex, prevLogTerm, commitIndex, entries, sender)
 	}
+}
 
-	for n := commitIndex + 1; n < len(node.Log) && node.Log[n].Term == node.CurrentTerm; n++ {
+func (node *Node) incrementPeerIndexes(message Message) {
+	req := message.Payload.(IncrementPeerIndexesCmd)
+
+	node.NextIndex[req.Pos] = len(node.Log)
+	node.MatchIndex[req.Pos] = len(node.Log) - 1
+
+	for n := node.CommitIndex + 1; n < len(node.Log) && node.Log[n].Term == node.CurrentTerm; n++ {
 		matches := 0
 		for i := range node.Peers {
+			if node.Peers[i] == nil {
+				continue
+			}
+
 			if node.MatchIndex[i] >= n {
 				matches += 1
 			}
 		}
 
-		if matches > len(node.Peers)/2 {
+		if matches > node.PeersNum/2 {
 			log.Printf("update commit index to: %d", n)
 			node.CommitIndex = n
 			break
@@ -340,5 +432,50 @@ func (node *Node) addLog(message Message) {
 			log.Printf("applying %v", node.Log[node.LastApplied+i])
 		}
 		node.LastApplied = node.CommitIndex
+	}
+}
+
+func (node *Node) decrementPeerIndexes(message Message) {
+	req := message.Payload.(DecrementPeerIndexesCmd)
+
+	node.NextIndex[req.Pos] -= 1
+}
+
+func (node *Node) vote(peer *Peer, peerPos int, nodeId string, currentTerm, lastLogIndex, lastLogTerm int, sender chan Message) {
+	var reply RequestVoteResponse
+	err := peer.Client.Call("RpcConfig.RequestVote", &RequestVoteCmd{
+		Term:         currentTerm,
+		CandidateId:  nodeId,
+		LastLogTerm:  lastLogTerm,
+		LastLogIndex: lastLogIndex,
+	}, &reply)
+
+	if err != nil {
+		log.Printf("error while calling %v, err: %s", peer, err)
+		if err == rpc.ErrShutdown {
+			sender <- Message{Payload: RemovePeerCmd{Pos: peerPos}, Sender: nil}
+		}
+
+	} else if reply.Term > node.CurrentTerm {
+		node.MessageChan <- Message{Payload: ChangeStateCmd{Term: reply.Term, State: FOLLOWER}}
+
+	} else if sender != nil && reply.VoteGranted {
+		sender <- Message{Payload: AddVoteCmd{}, Sender: nil}
+	}
+}
+
+func (node *Node) addVote() {
+	log.Printf("add vote")
+	node.Votes += 1
+	if node.Votes > (node.PeersNum+1)/2 && node.CurrentState == CANDIDATE {
+		log.Printf("won voting")
+		node.MessageChan <- Message{Payload: ChangeStateCmd{Term: node.CurrentTerm, State: LEADER}}
+	}
+}
+
+func (node *Node) startElectionTimer() {
+	for {
+		_ = <-time.After(time.Duration(randInt(150, 300)) * time.Millisecond)
+		node.MessageChan <- Message{Payload: StartElectionCmd{}}
 	}
 }
