@@ -7,7 +7,7 @@ The difference is that it's decomposed into relatively independent subproblems, 
 
 ## Description 
 
-Minimal implementation of the raft protocol in go, the client part is incomplet while the node one should be good (needs proper testing). 
+Minimal implementation of the raft protocol in go, the client part is incomplete while the node one should be good (needs proper testing). 
 The node is implemented using the actor model to simplify concurrency.
 
 
